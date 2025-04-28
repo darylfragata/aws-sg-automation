@@ -1,0 +1,129 @@
+variables:
+  BRANCH_NAME: "auto/sg-update-${CI_PIPELINE_ID}"
+  BASE_BRANCH: "main"
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "trigger" || $CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+stages:
+  - append
+  - create_mr
+  - plan
+  - deploy
+
+# -------------------------------------
+# Stage 1: Append SG Rules
+# -------------------------------------
+
+append_sg_rules:
+  stage: append
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "trigger" || $CI_PIPELINE_SOURCE == "web"'
+      when: on_success
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: never
+  script:
+    - |
+      echo "Processing security group rules..."
+      export SG_RULES="$SG_RULES_JSON"
+      echo "Running SG appender"
+      python3 scripts/append_sg_rules.py
+      echo "🔀 Creating branch ${BRANCH_NAME}"
+      git config --global user.email "ci@example.com"
+      git config --global user.name "CI Bot"
+      git remote set-url origin https://legendaryljf:${GITLAB_API_TOKEN}@gitlab.com/terraform2510508/aws-securitygroups-poc.git
+      git checkout -b "$BRANCH_NAME"
+      git add sap-dev/*.tf
+      git commit -m "Auto-append SG rules from API" || echo "No changes to commit"
+      git push origin "$BRANCH_NAME"
+
+
+# -------------------------------------
+# Stage 2: Create Merge Request
+# -------------------------------------
+
+create_merge_request:
+  stage: create_mr
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "trigger" || $CI_PIPELINE_SOURCE == "web"'
+      when: on_success
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: never
+  script:
+    - |
+      echo "📝 Creating merge request via API"
+      MR_PAYLOAD="{
+        \"id\": \"${CI_PROJECT_ID}\",
+        \"source_branch\": \"${BRANCH_NAME}\",
+        \"target_branch\": \"main\",
+        \"title\": \"Auto SG Rule Update\",
+        \"remove_source_branch\": true,
+        \"assignee_id\": ${ASSIGNEE_ID},
+        \"approver_ids\": [${APPROVER_ID}],
+        \"labels\": \"security-group,auto-update\",
+        \"description\": \"This is Automated Merge Request contains auto-appended security group rule updates. Please review and approve.\"
+      }"
+      curl --request POST \
+        --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" \
+        --header "Content-Type: application/json" \
+        --data "$MR_PAYLOAD" \
+        "https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/merge_requests"
+
+
+# -------------------------------------
+# Stage 3: Terraform Plan
+# -------------------------------------
+
+sap-dev-plan:
+  stage: plan
+  rules:
+    # Run during MR pipeline (user creates MR from GitLab UI or `git push`)
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: on_success
+
+    # Run after merge into main
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+      when: on_success
+
+    # Block everything else.
+    - when: never
+  before_script:
+    - echo "🔑 Assuming AWS role with session tags..."
+    # Assume the secure role with session tags
+    - |
+       echo "✅ Assumed role as: $(aws sts get-caller-identity --query Arn --output text)"
+  script:
+    - terraform --version
+    - cd sap-dev
+    - terraform init
+    - terraform plan -out="sap-dev-tfplanfile"
+  artifacts:
+    paths:
+      - sap-dev/sap-dev-tfplanfile
+
+# -------------------------------------
+# Stage 4: Terraform Apply (Only on main after merge)
+# -------------------------------------
+
+sap-dev-apply:
+  stage: deploy
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'  # Only after merge
+      when: on_success
+    - when: never
+  before_script:
+    - echo "🔑 Assuming AWS role with session tags..."
+    # Assume the secure role with session tags
+    - |
+       echo "✅ Assumed role as: $(aws sts get-caller-identity --query Arn --output text)"
+  script:
+    - terraform --version
+    - cd sap-dev
+    - terraform init
+    - terraform apply -input=false "sap-dev-tfplanfile"
+  needs:
+    - job: sap-dev-plan
+      optional: true
